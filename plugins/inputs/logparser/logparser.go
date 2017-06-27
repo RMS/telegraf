@@ -4,12 +4,12 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"strings"
 	"sync"
 
 	"github.com/influxdata/tail"
 
 	"github.com/influxdata/telegraf"
-	"github.com/influxdata/telegraf/internal/errchan"
 	"github.com/influxdata/telegraf/internal/globpath"
 	"github.com/influxdata/telegraf/plugins/inputs"
 
@@ -46,6 +46,7 @@ const sampleConfig = `
   ##   /var/log/*/*.log    -> find all .log files with a parent dir in /var/log
   ##   /var/log/apache.log -> only tail the apache log file
   files = ["/var/log/apache/access.log"]
+
   ## Read files that currently exist from the beginning. Files that are created
   ## while telegraf is running (and that match the "files" globs) will always
   ## be read from the beginning.
@@ -118,14 +119,10 @@ func (l *LogParserPlugin) Start(acc telegraf.Accumulator) error {
 	}
 
 	// compile log parser patterns:
-	errChan := errchan.New(len(l.parsers))
 	for _, parser := range l.parsers {
 		if err := parser.Compile(); err != nil {
-			errChan.C <- err
+			return err
 		}
-	}
-	if err := errChan.Error(); err != nil {
-		return err
 	}
 
 	l.wg.Add(1)
@@ -143,8 +140,6 @@ func (l *LogParserPlugin) tailNewfiles(fromBeginning bool) error {
 		seek.Offset = 0
 	}
 
-	errChan := errchan.New(len(l.Files))
-
 	// Create a "tailer" for each file
 	for _, filepath := range l.Files {
 		g, err := globpath.Compile(filepath)
@@ -153,7 +148,6 @@ func (l *LogParserPlugin) tailNewfiles(fromBeginning bool) error {
 			continue
 		}
 		files := g.Match()
-		errChan = errchan.New(len(files))
 
 		for file, _ := range files {
 			if _, ok := l.tailers[file]; ok {
@@ -168,7 +162,7 @@ func (l *LogParserPlugin) tailNewfiles(fromBeginning bool) error {
 					Location:  &seek,
 					MustExist: true,
 				})
-			errChan.C <- err
+			l.acc.AddError(err)
 
 			// create a goroutine for each "tailer"
 			l.wg.Add(1)
@@ -177,7 +171,7 @@ func (l *LogParserPlugin) tailNewfiles(fromBeginning bool) error {
 		}
 	}
 
-	return errChan.Error()
+	return nil
 }
 
 // receiver is launched as a goroutine to continuously watch a tailed logfile
@@ -194,9 +188,12 @@ func (l *LogParserPlugin) receiver(tailer *tail.Tail) {
 			continue
 		}
 
+		// Fix up files with Windows line endings.
+		text := strings.TrimRight(line.Text, "\r")
+
 		select {
 		case <-l.done:
-		case l.lines <- line.Text:
+		case l.lines <- text:
 		}
 	}
 }
